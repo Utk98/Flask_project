@@ -1,0 +1,272 @@
+from flask import Flask, request
+from flask_cors import CORS
+from flask_socketio import SocketIO
+import os
+import time
+import cv2
+import numpy as np
+from keras.models import load_model
+from keras.preprocessing.image import img_to_array
+import face_recognition
+from collections import Counter
+from threading import Thread
+import queue
+import dlib
+import matplotlib.pyplot as plt
+from PIL import Image
+import eventlet
+import ssl
+
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
+socketio = SocketIO(app, cors_allowed_origins="*", ping_timeout=20000, max_http_buffer_size=10 * 1024 * 1024, ping_interval=25000, ssl_context=('C:/Users/OMR-09/Desktop/project_directory/create-cert.pem','C:/Users/OMR-09/Desktop/project_directory/create-cert-key.pem'))
+
+video_dir = os.path.join(os.path.dirname(__file__), 'videos')
+if not os.path.exists(video_dir):
+    os.makedirs(video_dir)
+
+# Load ML models with error handling
+try:
+    face_classifier = cv2.CascadeClassifier(
+        "C:/Users/OMR-09/Desktop/flask_code/haarcascade_frontalface_default.xml")
+    emotion_classifier = load_model(
+        "C:/Users/OMR-09/Desktop/flask_code/model.h5")
+    emotion_labels = ['Angry', 'Disgust', 'Fear', 'Happy', 'Neutral', 'Sad', 'Surprise']
+    KNOWN_IMAGES_DIR = "C:/Users/OMR-09/Desktop/flask_code/images"  # Change this to the directory of your known person images
+    # "C:\Users\OMR-09\Pictures\Screenshots"
+    detector = dlib.get_frontal_face_detector()
+    predictor = dlib.shape_predictor("C:/Users/OMR-09/Desktop/flask_code/shape_predictor_68_face_landmarks.dat")
+except Exception as e:
+    print(f"Error loading models: {e}")
+    exit(1)
+
+# Load all known face encodings
+def load_known_faces(known_images_dir):
+    known_encodings = []
+    for file_name in os.listdir(known_images_dir):
+        image_path = os.path.join(known_images_dir, file_name)
+        try:
+            image = face_recognition.load_image_file(image_path)
+            encoding = face_recognition.face_encodings(image)[0]
+            known_encodings.append(encoding)
+        except Exception as e:
+            print(f"Error processing file {file_name}: {e}")
+    return known_encodings
+
+known_face_encodings = load_known_faces(KNOWN_IMAGES_DIR)
+
+# Create a queue to hold video data
+video_queue = queue.Queue()
+
+def create_file_write_stream(file_name):
+    try:
+        file_path = os.path.join(video_dir, f"{file_name}.webm")
+        file_stream = open(file_path, 'wb')
+        return file_stream, file_path
+    except Exception as e:
+        print(f"Error creating file write stream: {e}")
+        return None, None
+
+def emotion_fdetect(video_path):
+    emotion_counter = Counter()
+    cap = cv2.VideoCapture(video_path)
+
+    if not cap.isOpened():
+        return "Video Capture Error"
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_classifier.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+
+        for (x, y, w, h) in faces:
+            roi_gray = gray[y:y+h, x:x+w]
+            roi_gray = cv2.resize(roi_gray, (48, 48), interpolation=cv2.INTER_AREA)
+
+            if np.sum([roi_gray]) != 0:
+                roi = roi_gray.astype('float') / 255.0
+                roi = img_to_array(roi)
+                roi = np.expand_dims(roi, axis=0)
+
+                prediction = emotion_classifier.predict(roi)[0]
+                label = emotion_labels[prediction.argmax()]
+                emotion_counter[label] += 1
+
+    cap.release()
+    most_common_emotion = emotion_counter.most_common(1)
+    if most_common_emotion:
+        return most_common_emotion[0][0]
+    else:
+        return "No emotions detected."
+
+def detect_person_match(video_path):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return "Video Capture Error"
+
+    ret, frame = cap.read()
+    if not ret:
+        cap.release()
+        return "Video Capture Error"
+
+    face_locations = face_recognition.face_locations(frame)
+    face_count = len(face_locations)
+
+    if face_count == 0:
+        cap.release()
+        return "No Face Detected"
+
+    if face_count > 1:
+        cap.release()
+        return "More than One Face Detected"
+
+    face_encodings = face_recognition.face_encodings(frame, face_locations)
+    for known_encoding in known_face_encodings:
+        match = face_recognition.compare_faces([known_encoding], face_encodings[0])
+        if match[0]:
+            neck_bending = detect_neck_bending(frame, face_locations[0])
+            cap.release()
+            if neck_bending:
+                return "Neck Movement"
+            else:
+                return "Match"
+
+    cap.release()
+    return "Not Match"
+
+def detect_neck_bending(frame, face_location):
+    face_landmarks = face_recognition.face_landmarks(frame, [face_location])
+    if not face_landmarks:
+        return False
+
+    face_landmarks = face_landmarks[0]
+    top_nose = face_landmarks['nose_bridge'][0]
+    bottom_nose = face_landmarks['nose_tip'][0]
+    top_chin = face_landmarks['chin'][8]
+    bottom_chin = face_landmarks['chin'][0]
+
+    neck_vector = np.array(bottom_chin) - np.array(top_chin)
+    face_vector = np.array(bottom_nose) - np.array(top_nose)
+
+    angle = np.degrees(np.arccos(np.dot(neck_vector, face_vector) /
+                                  (np.linalg.norm(neck_vector) * np.linalg.norm(face_vector))))
+    print(angle)
+    return angle > 132 or angle < 124
+
+def detect_glasses(frame):
+    img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    faces = detector(img)
+    if len(faces) == 0:
+        return "No Face Detected"
+
+    rect = faces[0]
+    sp = predictor(img, rect)
+    landmarks = np.array([[p.x, p.y] for p in sp.parts()])
+
+    nose_bridge_x = [landmarks[i][0] for i in [28, 29, 30, 31, 33, 34, 35]]
+    nose_bridge_y = [landmarks[i][1] for i in [28, 29, 30, 31, 33, 34, 35]]
+
+    x_min = min(nose_bridge_x)
+    x_max = max(nose_bridge_x)
+    y_min = landmarks[20][1]
+    y_max = landmarks[31][1]
+
+    img2 = Image.fromarray(img)
+    img2 = img2.crop((x_min, y_min, x_max, y_max))
+
+    img_blur = cv2.GaussianBlur(np.array(img2), (3, 3), sigmaX=0, sigmaY=0)
+    edges = cv2.Canny(image=img_blur, threshold1=90, threshold2=185)
+
+    edges_center = edges.T[int(len(edges.T) / 2)]
+
+    if 255 in edges_center:
+        return "Glasses Present"
+    else:
+        return "Glasses Absent"
+
+def detect_background_movement(video_path):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return "Video Capture Error"
+
+    ret, prev_frame = cap.read()
+    if not ret:
+        cap.release()
+        return "Video Capture Error"
+
+    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+    movement_detected = False
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        diff = cv2.absdiff(prev_gray, gray)
+        _, thresh = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
+        movement = cv2.countNonZero(thresh)
+
+        if movement > 2500:  # Threshold for detecting movement
+            movement_detected = True
+            break
+
+        prev_gray = gray
+
+    cap.release()
+    if movement_detected:
+        return "Background Movement Detected"
+    else:
+        return "No Background Movement"
+
+@socketio.on('connect')
+def handle_connect():
+    print('Client connected')
+
+@socketio.on('video_data')
+def handle_video_data(data):
+    file_name = f"video_{int(time.time() * 1000)}"
+    file_stream, file_path = create_file_write_stream(file_name)
+
+    if file_stream is None:
+        socketio.emit('result', {'result': 'File Write Error', 'emotion': 'N/A'})
+        return
+
+    try:
+        file_stream.write(data)
+    except Exception as e:
+        print(f"Error writing to file: {e}")
+        socketio.emit('result', {'result': 'File Write Error', 'emotion': 'N/A'})
+    finally:
+        file_stream.close()
+        video_queue.put(file_path)  # Put the file path into the queue
+
+    # If the queue has only one video, process it
+    if video_queue.qsize() == 1:
+        process_next_video()
+
+def process_next_video():
+    file_path = video_queue.get()  # Get the next video file path from the queue
+    result = detect_person_match(file_path)
+    emotion = emotion_fdetect(file_path)
+    glasses = detect_glasses(cv2.VideoCapture(file_path).read()[1])
+    background_movement = detect_background_movement(file_path)
+    socketio.emit('result', {'result': result, 'emotion': emotion, 'glasses': glasses, 'background_movement': background_movement})
+
+    # If there are more videos in the queue, process the next one
+    if not video_queue.empty():
+        process_next_video()
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print('Client disconnected')
+
+@socketio.on_error()
+def error_handler(e):
+    print(f"Socket error: {e}")
+
+if __name__ == '__main__':
+    socketio.run(app, port=5000, host='0.0.0.0', debug=True, keyfile='C:/Users/OMR-09/Desktop/flask_code/create-cert-key.pem', certfile='C:/Users/OMR-09/Desktop/flask_code/create-cert.pem')
